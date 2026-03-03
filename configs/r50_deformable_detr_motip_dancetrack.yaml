@@ -128,6 +128,12 @@ DET_THRESH: 0.3
 NEWBORN_THRESH: 0.6
 ID_THRESH: 0.2
 AREA_THRESH: 0
+# HAT (History-Aware Transformation) settings:
+USE_HAT: False                  # Enable HAT (FLD-based feature transformation)
+HAT_HIST_LEN: 60               # History window length T (max features per trajectory)
+HAT_FACTOR_THR: 4.0            # Min ratio of historical features to trajectories to enable FLD
+HAT_ALPHA: 0.5                 # Knowledge Integration blending coefficient (0=original, 1=HAT only)
+HAT_WEIGHT_DECAY: 0.9          # Temporal weight decay for FIFO queue (Temporal-Shifted Centroid)
 INFERENCE_ONLY_DETR:
 
 # Outputs settings:

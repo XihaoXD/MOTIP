@@ -1,0 +1,9 @@
+SUPER_CONFIG_PATH: configs/r50_deformable_detr_motip_dancetrack.yaml
+
+# HAT (History-Aware Transformation) settings:
+# Override the base config to enable HAT with FLD-based feature transformation.
+USE_HAT: True                   # Enable HAT (FLD-based feature transformation)
+HAT_HIST_LEN: 60               # History window length T (max features per trajectory)
+HAT_FACTOR_THR: 4.0            # Min ratio of historical features to trajectories to enable FLD
+HAT_ALPHA: 0.5                 # Knowledge Integration blending coefficient (0=original, 1=HAT only)
+HAT_WEIGHT_DECAY: 0.9          # Temporal weight decay for FIFO queue (Temporal-Shifted Centroid)

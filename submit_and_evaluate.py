@@ -99,6 +99,12 @@ def submit_and_evaluate(config: dict):
         inference_only_detr=config["INFERENCE_ONLY_DETR"] if config["INFERENCE_ONLY_DETR"] is not None
         else config["ONLY_DETR"],
         dtype=config.get("INFERENCE_DTYPE", "FP32"),
+        # HAT (History-Aware Transformation) settings:
+        use_hat=config.get("USE_HAT", False),
+        hat_hist_len=config.get("HAT_HIST_LEN", 60),
+        hat_factor_thr=config.get("HAT_FACTOR_THR", 4.0),
+        hat_alpha=config.get("HAT_ALPHA", 0.5),
+        hat_weight_decay=config.get("HAT_WEIGHT_DECAY", 0.9),
     )
 
     if metrics is not None:
@@ -136,6 +142,12 @@ def submit_and_evaluate_one_model(
         area_thresh: int = 0,
         inference_only_detr: bool = False,
         dtype: str = "FP32",
+        # HAT (History-Aware Transformation) settings:
+        use_hat: bool = False,
+        hat_hist_len: int = 60,
+        hat_factor_thr: float = 4.0,
+        hat_alpha: float = 0.5,
+        hat_weight_decay: float = 0.9,
 ):
     # Build the datasets:
     inference_dataset = dataset_classes[dataset](
@@ -206,6 +218,12 @@ def submit_and_evaluate_one_model(
             area_thresh=area_thresh,
             only_detr=inference_only_detr,
             dtype=dtype,
+            # HAT settings:
+            use_hat=use_hat,
+            hat_hist_len=hat_hist_len,
+            hat_factor_thr=hat_factor_thr,
+            hat_alpha=hat_alpha,
+            hat_weight_decay=hat_weight_decay,
         )
         if is_fake:
             logger.info(
