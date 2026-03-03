@@ -2,6 +2,7 @@
 
 import torch
 import einops
+import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
 from structures.instances import Instances
@@ -9,6 +10,7 @@ from structures.ordered_set import OrderedSet
 from utils.misc import distributed_device
 from utils.box_ops import box_cxcywh_to_xywh
 from models.misc import get_model
+from models.hat import LDA, FIFOQueue
 
 
 class RuntimeTracker:
@@ -27,6 +29,12 @@ class RuntimeTracker:
             area_thresh: int = 0,
             only_detr: bool = False,
             dtype: torch.dtype = torch.float32,
+            # HAT (History-Aware Transformation) settings:
+            use_hat: bool = False,
+            hat_hist_len: int = 60,
+            hat_factor_thr: float = 4.0,
+            hat_alpha: float = 0.5,
+            hat_weight_decay: float = 0.9,
     ):
         self.model = model
         self.model.eval()
@@ -84,6 +92,15 @@ class RuntimeTracker:
             (0, 0), dtype=torch.bool, device=distributed_device(),
         )
         # self.trajectory_features = torch.zeros(())
+
+        # HAT (History-Aware Transformation) settings:
+        self.use_hat = use_hat
+        self.hat_hist_len = hat_hist_len
+        self.hat_factor_thr = hat_factor_thr
+        self.hat_alpha = hat_alpha
+        self.hat_weight_decay = hat_weight_decay
+        # HAT per-trajectory feature queues: {id_label: FIFOQueue}
+        self.hat_queues: dict[int, FIFOQueue] = {}
 
         self.current_track_results = {}
         return
@@ -151,11 +168,19 @@ class RuntimeTracker:
         for _ in range(len(id_labels)):
             self.id_queue.add(id_labels[_].item())
 
+        # Update HAT feature queues (before trajectory update):
+        if self.use_hat:
+            self._update_hat_queues(output_embeds=output_embeds, id_labels=id_labels)
+
         # Update trajectory infos:
         self._update_trajectory_infos(boxes=boxes, output_embeds=output_embeds, id_labels=id_labels)
 
         # Filter out inactive tracks:
         self._filter_out_inactive_tracks()
+
+        # Cleanup HAT queues for inactive trajectories:
+        if self.use_hat:
+            self._cleanup_hat_queues()
         pass
         return
 
@@ -210,6 +235,14 @@ class RuntimeTracker:
                 id_scores = id_logits.softmax(dim=-1)
             else:
                 id_scores = id_logits.sigmoid()
+
+            # 4.5. Apply HAT (History-Aware Transformation) if enabled:
+            if self.use_hat:
+                id_scores = self._apply_hat_transform(
+                    id_scores=id_scores,
+                    current_embeds=output_embeds,
+                )
+
             # 5. assign id labels:
             # Different assignment protocols:
             match self.assignment_protocol:
@@ -318,6 +351,15 @@ class RuntimeTracker:
 
     def _filter_out_inactive_tracks(self):
         is_active = torch.sum((~self.trajectory_masks).to(torch.int64), dim=0) > 0
+        # Record inactive IDs before filtering (for HAT queue cleanup):
+        if self.use_hat and self.trajectory_id_labels.shape[0] > 0:
+            all_ids = set(self.trajectory_id_labels[0].tolist())
+            active_mask_ids = self.trajectory_id_labels[0][is_active].tolist() if is_active.any() else []
+            inactive_ids = all_ids - set(active_mask_ids)
+            # Recycle HAT queues for inactive trajectories:
+            for iid in inactive_ids:
+                if iid in self.hat_queues:
+                    del self.hat_queues[iid]
         self.trajectory_features = self.trajectory_features[:, is_active]
         self.trajectory_boxes = self.trajectory_boxes[:, is_active]
         self.trajectory_id_labels = self.trajectory_id_labels[:, is_active]
@@ -376,6 +418,156 @@ class RuntimeTracker:
                     id_labels.append(_id_label)
 
         return id_labels
+
+    def _apply_hat_transform(self, id_scores: torch.Tensor, current_embeds: torch.Tensor) -> torch.Tensor:
+        """
+        Apply History-Aware Transformation (HAT) using Fisher Linear Discriminant.
+
+        This method:
+        1. Collects historical features from per-trajectory FIFO queues
+        2. Fits an FLD model to find a discriminative projection
+        3. Computes cosine similarity between FLD-transformed current embeddings
+           and trajectory centroids
+        4. Blends the FLD-based similarity with the original ID prediction scores
+           using Knowledge Integration (HAT paper Eq. 10):
+               final_scores = alpha * hat_scores + (1 - alpha) * original_scores
+
+        The FLD is only applied when enough historical features are accumulated
+        (controlled by hat_factor_thr).
+
+        Args:
+            id_scores: Original ID prediction scores from the ID decoder,
+                       shape (N_det, num_id_vocabulary + 1).
+            current_embeds: DETR output embeddings for current detections,
+                           shape (N_det, embed_dim).
+
+        Returns:
+            Blended ID scores of the same shape as id_scores.
+        """
+        # Collect historical features and their trajectory IDs from queues:
+        all_hist_features = []
+        all_hist_ids = []
+        all_hist_weights = []
+        # Map from trajectory id_label to queue:
+        trajectory_id_labels = self.trajectory_id_labels[0].tolist() if self.trajectory_id_labels.shape[0] > 0 else []
+        num_trajectories = len(set(trajectory_id_labels))
+
+        for id_label in set(trajectory_id_labels):
+            if id_label in self.hat_queues and len(self.hat_queues[id_label]) > 0:
+                feats, weights = self.hat_queues[id_label].get()
+                for feat, weight in zip(feats, weights):
+                    all_hist_features.append(feat)
+                    all_hist_ids.append(id_label)
+                    all_hist_weights.append(weight)
+
+        # Check if we have enough historical features to fit FLD:
+        if (len(all_hist_features) == 0 or
+                num_trajectories < 2 or
+                len(all_hist_features) < self.hat_factor_thr * num_trajectories):
+            return id_scores
+
+        # Stack historical features:
+        hist_features = torch.stack(all_hist_features, dim=0).to(
+            dtype=torch.float32, device=current_embeds.device
+        )
+        hist_ids = torch.tensor(all_hist_ids, dtype=torch.long, device=current_embeds.device)
+        hist_weights = torch.tensor(
+            [w.item() if isinstance(w, torch.Tensor) else w for w in all_hist_weights],
+            dtype=torch.float32, device=current_embeds.device,
+        )
+
+        # Fit the FLD model:
+        lda = LDA(
+            use_shrinkage=True,
+            use_weighted_class_mean=True,
+            dtype=torch.float32,
+            device=str(current_embeds.device),
+        )
+        try:
+            lda.fit(hist_features, hist_ids, score=hist_weights)
+        except Exception:
+            # If FLD fitting fails (e.g., singular matrix), fall back to original scores
+            return id_scores
+
+        if not lda.is_fit():
+            return id_scores
+
+        # Transform current detection embeddings and compute trajectory centroids:
+        current_embeds_f32 = current_embeds.to(dtype=torch.float32)
+        transformed_current = lda.transform(current_embeds_f32)  # (N_det, D')
+
+        # Compute centroid for each trajectory in the transformed space:
+        unique_traj_ids = list(set(trajectory_id_labels))
+        traj_centroids = []
+        traj_id_to_idx = {}
+        for idx, tid in enumerate(unique_traj_ids):
+            traj_id_to_idx[tid] = idx
+            mask = hist_ids == tid
+            if mask.any():
+                traj_feats = hist_features[mask]
+                traj_weights_for_centroid = hist_weights[mask]
+                transformed_feats = lda.transform(traj_feats)
+                # Weighted centroid:
+                w = traj_weights_for_centroid[:, None]
+                centroid = (w * transformed_feats).sum(dim=0) / w.sum()
+                traj_centroids.append(centroid)
+            else:
+                traj_centroids.append(torch.zeros(
+                    transformed_current.shape[-1],
+                    dtype=torch.float32, device=current_embeds.device,
+                ))
+        traj_centroids = torch.stack(traj_centroids, dim=0)  # (num_traj, D')
+
+        # Compute cosine similarity between transformed detections and centroids:
+        transformed_current_norm = F.normalize(transformed_current, dim=-1)
+        traj_centroids_norm = F.normalize(traj_centroids, dim=-1)
+        cos_sim = transformed_current_norm @ traj_centroids_norm.T  # (N_det, num_traj)
+        # Convert cosine similarity from [-1, 1] to [0, 1]:
+        cos_sim = (cos_sim + 1.0) / 2.0
+
+        # Build HAT scores aligned with id_scores shape (N_det, num_id_vocabulary + 1):
+        hat_scores = torch.zeros_like(id_scores)
+        # Fill in the similarity scores for tracked trajectories:
+        for tid, traj_idx in traj_id_to_idx.items():
+            if tid < id_scores.shape[-1]:
+                hat_scores[:, tid] = cos_sim[:, traj_idx]
+
+        # For the newborn/special token (last column), use original score:
+        hat_scores[:, -1] = id_scores[:, -1]
+
+        # Knowledge Integration (HAT paper Eq. 10):
+        # final_scores = alpha * hat_scores + (1 - alpha) * original_scores
+        blended_scores = self.hat_alpha * hat_scores + (1 - self.hat_alpha) * id_scores
+
+        return blended_scores.to(dtype=id_scores.dtype)
+
+    def _update_hat_queues(self, output_embeds: torch.Tensor, id_labels: torch.Tensor):
+        """
+        Update the HAT per-trajectory feature queues with new detection embeddings.
+
+        Called after ID assignment in each frame to accumulate historical features
+        for FLD fitting.
+
+        Args:
+            output_embeds: DETR output embeddings of shape (N, embed_dim).
+            id_labels: Assigned ID labels of shape (N,).
+        """
+        for i in range(len(id_labels)):
+            id_label = id_labels[i].item()
+            if id_label not in self.hat_queues:
+                self.hat_queues[id_label] = FIFOQueue(
+                    max_len=self.hat_hist_len,
+                    weight_decay_ratio=self.hat_weight_decay,
+                )
+            self.hat_queues[id_label].add(output_embeds[i].cpu())
+
+    def _cleanup_hat_queues(self):
+        """Remove HAT queues for trajectories that are no longer active."""
+        if self.trajectory_id_labels.shape[0] > 0:
+            active_ids = set(self.trajectory_id_labels[0].tolist())
+            inactive_ids = [k for k in self.hat_queues if k not in active_ids]
+            for k in inactive_ids:
+                del self.hat_queues[k]
 
     def _id_max_assignment(self, id_scores: torch.Tensor):
         id_labels = [self.num_id_vocabulary] * len(id_scores)  # final ID labels
