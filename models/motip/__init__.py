@@ -5,6 +5,7 @@ from structures.args import Args
 from models.deformable_detr.deformable_detr import build as build_deformable_detr
 from models.motip.trajectory_modeling import TrajectoryModeling
 from models.motip.id_decoder import IDDecoder
+from models.motip.fld_projector import FLDProjector
 
 
 def build(config: dict):
@@ -67,6 +68,15 @@ def build(config: dict):
         use_shared_aux_head=config["USE_SHARED_AUX_HEAD"],
     ) if config["ONLY_DETR"] is False else None
 
+    # FLD: learnable LDA->feature_dim map (optional; used with USE_FLD_TRAIN / motip_fld inference)
+    _fld_projector = None
+    # Default False: old checkpoints have no fld_projector; enable in yaml after FLD training or for fresh init.
+    if config["ONLY_DETR"] is False and config.get("USE_FLD_PROJECTOR", False):
+        _fld_projector = FLDProjector(
+            lda_input_dim=config["NUM_ID_VOCABULARY"] - 1,
+            feature_dim=config["FEATURE_DIM"],
+        )
+
     # Construct MOTIP model:
     motip_model = MOTIP(
         detr=detr,
@@ -74,6 +84,7 @@ def build(config: dict):
         only_detr=config["ONLY_DETR"],
         trajectory_modeling=_trajectory_modeling,
         id_decoder=_id_decoder,
+        fld_projector=_fld_projector,
     )
 
     return motip_model, detr_criterion

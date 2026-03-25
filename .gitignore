@@ -1,4 +1,13 @@
 # Root gitignore file
 
 # PyCharm
-.idea/
+.idea
+./pretrains/
+./outputs//
+MOTIP-FFE/pretrains/
+MOTIP-FFE/outputs/
+# 如果有其他临时文件或数据，也可一并加入
+*.pth
+*.pt
+*.ckpt
+*.log

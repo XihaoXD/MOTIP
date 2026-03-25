@@ -25,6 +25,7 @@ from data.util import collate_fn
 from log.log import TPS, Metrics
 from models.misc import load_detr_pretrain, save_checkpoint, load_checkpoint
 from models.misc import get_model
+from models.motip.fld_training import apply_fld_to_seq_info_training
 from utils.nested_tensor import NestedTensor
 from submit_and_evaluate import submit_and_evaluate_one_model
 
@@ -187,6 +188,12 @@ def train_engine(config: dict):
             outputs_dir=outputs_dir,
             is_last_epochs=(epoch == config["EPOCHS"] - 1),
             multi_last_checkpoints=config["MULTI_LAST_CHECKPOINTS"],
+            use_fld_train=config.get("USE_FLD_TRAIN", False),
+            fld_align_loss_weight=config.get("FLD_ALIGN_LOSS_WEIGHT", 0.1),
+            fld_factor_thr=config.get("FLD_FACTOR_THR", 4.0),
+            fld_use_standard_scaler=config.get("FLD_USE_STANDARD_SCALER", False),
+            fld_direct_inter_class_diff=config.get("FLD_DIRECT_INTER_CLASS_DIFF", True),
+            fld_use_weighted_class_mean=config.get("FLD_USE_WEIGHTED_CLASS_MEAN", True),
         )
 
         # Get learning rate:
@@ -229,6 +236,7 @@ def train_engine(config: dict):
                     outputs_dir=os.path.join(outputs_dir, "train", "eval_during_train", f"epoch_{epoch}"),
                     image_max_longer=config["INFERENCE_MAX_LONGER"],
                     size_divisibility=config.get("SIZE_DIVISIBILITY", 0),
+                    tracking_mode=config.get("TRACKING_MODE"),
                     miss_tolerance=config["MISS_TOLERANCE"],
                     use_sigmoid=config["USE_FOCAL_LOSS"] if "USE_FOCAL_LOSS" in config else False,
                     assignment_protocol=config["ASSIGNMENT_PROTOCOL"] if "ASSIGNMENT_PROTOCOL" in config else "hungarian",
@@ -284,6 +292,12 @@ def train_one_epoch(
         outputs_dir: str = None,
         is_last_epochs: bool = False,
         multi_last_checkpoints: int = 0,
+        use_fld_train: bool = False,
+        fld_align_loss_weight: float = 0.1,
+        fld_factor_thr: float = 4.0,
+        fld_use_standard_scaler: bool = False,
+        fld_direct_inter_class_diff: bool = True,
+        fld_use_weighted_class_mean: bool = True,
 ):
     current_last_checkpoint_idx = 0
 
@@ -412,12 +426,26 @@ def train_one_epoch(
         detr_loss_dict, detr_indices = detr_criterion(outputs=detr_outputs, targets=detr_targets_flatten, batch_len=detr_criterion_batch_len)
 
         # Whether to only train the DETR, OR to train the MOTIP together:
+        fld_align_loss = None
         if not only_detr:
             _G, _, _N = annotations[0][0]["trajectory_id_labels"].shape
             # Need to prepare for MOTIP:
             seq_info = prepare_for_motip(
                 detr_outputs=detr_outputs, annotations=annotations, detr_indices=detr_indices,
             )
+            if use_fld_train:
+                _m = get_model(model)
+                _fp = getattr(_m, "fld_projector", None)
+                if _fp is not None:
+                    seq_info, fld_align_loss = apply_fld_to_seq_info_training(
+                        seq_info=seq_info,
+                        fld_projector=_fp,
+                        num_id_vocabulary=_m.num_id_vocabulary,
+                        fld_factor_thr=fld_factor_thr,
+                        fld_use_standard_scaler=fld_use_standard_scaler,
+                        fld_direct_inter_class_diff=fld_direct_inter_class_diff,
+                        fld_use_weighted_class_mean=fld_use_weighted_class_mean,
+                    )
             seq_info = model(seq_info=seq_info, part="trajectory_modeling")
             id_logits, id_gts, id_masks = model(
                 seq_info=seq_info,
@@ -430,6 +458,7 @@ def train_one_epoch(
             pass
         else:
             id_loss = None
+            fld_align_loss = None
 
         # Backward:
         with accelerator.autocast():
@@ -438,11 +467,15 @@ def train_one_epoch(
                 detr_loss_dict[k] * detr_weight_dict[k] for k in detr_loss_dict.keys() if k in detr_weight_dict
             )
             loss = detr_loss + (id_loss if id_loss is not None else 0) * id_criterion.weight
+            if fld_align_loss is not None:
+                loss = loss + fld_align_loss_weight * fld_align_loss
             # Logging losses:
             metrics.update(name="loss", value=loss.item())
             metrics.update(name="detr_loss", value=detr_loss.item())
             if id_loss is not None:
                 metrics.update(name="id_loss", value=id_loss.item())
+            if fld_align_loss is not None:
+                metrics.update(name="fld_align_loss", value=fld_align_loss.item())
             for k, v in detr_loss_dict.items():
                 metrics.update(name=k, value=v.item())
             loss /= accumulate_steps

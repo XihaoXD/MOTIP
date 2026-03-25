@@ -2,6 +2,7 @@
 
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
+from typing import Optional
 
 
 class MOTIP(nn.Module):
@@ -12,6 +13,7 @@ class MOTIP(nn.Module):
             only_detr: bool,
             trajectory_modeling: nn.Module,
             id_decoder: nn.Module,
+            fld_projector: Optional[nn.Module] = None,
     ):
         super().__init__()
         self.detr = detr
@@ -19,6 +21,8 @@ class MOTIP(nn.Module):
         self.only_detr = only_detr
         self.trajectory_modeling = trajectory_modeling
         self.id_decoder = id_decoder
+        # Optional: LDA (<= K-1 dim) -> feature_dim for FLD + ID decoder (trainable).
+        self.fld_projector = fld_projector
 
         if self.id_decoder is not None:
             self.num_id_vocabulary = self.id_decoder.num_id_vocabulary

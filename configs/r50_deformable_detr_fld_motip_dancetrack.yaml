@@ -1,0 +1,182 @@
+# =============================================================================
+# FLD 联合训练：DETR + FLDProjector + trajectory_modeling + ID decoder 同一套 loss 反传。
+# - USE_FLD_TRAIN=True：训练 forward 在 clip 内拟合 LDA(no_grad)，再用可训的 FLDProjector 写入 seq_info，
+#   其后仍走 trajectory_modeling → id_decoder；总 loss = detr + id_loss + FLD_ALIGN_LOSS_WEIGHT * fld_align_loss。
+# - USE_FLD_PROJECTOR=True：必须打开，否则 apply_fld_to_seq_info_training 不会改特征（与联合训练矛盾）。
+# - TRACKING_MODE=motip_fld：epoch 评测与训练一致（ID 头始终见 FLD 后特征），避免 train/eval 分布错位。
+# - 建议：若有「纯 MOTIP」阶段 1 的 checkpoint，填 RESUME_MODEL 再训本配置，比从零训随机 projector 更稳。
+# - 若 loss 震荡或 ID 发散，可把 LR 降到 5e-5，或先冻结 backbone（需改 train 里 param 分组，当前未拆）。
+# =============================================================================
+SUPER_CONFIG_PATH:
+
+# Seed:
+SEED: 42
+
+# System Settings:
+NUM_WORKERS: 12
+PREFETCH_FACTOR: 2
+DEVICE: cuda
+
+# Data settings:
+# 1. paths:
+DATA_ROOT: ./datasets/
+DATASETS: [DanceTrack]
+DATASET_SPLITS: [train25%]
+# 2. sampling:
+SAMPLE_STEPS: [0, ]
+SAMPLE_LENGTHS: [30, ]
+SAMPLE_INTERVALS: [4, ]
+LENGTH_PER_ITERATION:   # how many frames to process per iteration, the sample length should be divisible by this number
+
+# Data augmentation settings:
+# 1. image sizes:
+AUG_RESIZE_SCALES: [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
+AUG_MAX_SIZE: 1440
+AUG_RANDOM_RESIZE: [400, 500, 600]
+AUG_RANDOM_CROP_MIN: 384
+AUG_RANDOM_CROP_MAX: 600
+# 2. random shift:
+AUG_MAX_SHIFT_RATIO: 0.06
+# 3. bounding box overflow:
+AUG_OVERFLOW_BBOX: False
+# 4. color jitter:
+AUG_BRIGHTNESS: 0.4
+AUG_CONTRAST: 0.4
+AUG_SATURATION: 0.4
+AUG_HUE: 0.2
+AUG_COLOR_JITTER_V2: False
+# 5. for id biding:
+AUG_NUM_GROUPS: 6
+AUG_TRAJECTORY_OCCLUSION_PROB: 0.5
+AUG_TRAJECTORY_SWITCH_PROB: 0.5
+
+# Model settings:
+# MOTIP:
+ONLY_DETR: False
+NUM_CLASSES: 1
+NUM_ID_VOCABULARY: 50
+DETR_FRAMEWORK: deformable_detr
+FEATURE_DIM: 256
+FFN_DIM_RATIO: 2
+ID_DIM: 256
+HEAD_DIM: 32
+NUM_ID_DECODER_LAYERS: 6
+ID_LOSS_WEIGHT: 1.0
+REL_PE_LENGTH: 30
+USE_AUX_LOSS: False
+USE_SHARED_AUX_HEAD: True
+USE_FOCAL_LOSS: False
+# About DETR Framework:
+BACKBONE: resnet50
+DILATION: False
+DETR_NUM_QUERIES: 300
+DETR_NUM_FEATURE_LEVELS: 4
+DETR_AUX_LOSS: True
+DETR_WITH_BOX_REFINE: True
+DETR_TWO_STAGE: False
+DETR_HIDDEN_DIM: 256
+DETR_MASKS: False
+DETR_POSITION_EMBEDDING: sine
+DETR_NUM_HEADS: 8
+DETR_ENC_LAYERS: 6
+DETR_DEC_LAYERS: 6
+DETR_DIM_FEEDFORWARD: 1024
+DETR_DROPOUT: 0.0
+DETR_DEC_N_POINTS: 4
+DETR_ENC_N_POINTS: 4
+DETR_CLS_LOSS_COEF: 2.0
+DETR_BBOX_LOSS_COEF: 5.0
+DETR_GIOU_LOSS_COEF: 2.0
+DETR_FOCAL_ALPHA: 0.25
+DETR_SET_COST_CLASS: 2.0
+DETR_SET_COST_BBOX: 5.0
+DETR_SET_COST_GIOU: 2.0
+DETR_CRITERION_BATCH_LEN: 10
+
+# Training strategies:
+BATCH_SIZE: 1
+# 联合微调时若不稳定可改为 5.0e-5
+LR: 1.0e-4
+LR_BACKBONE_NAMES: [backbone.0]
+LR_BACKBONE_SCALE: 0.1
+LR_LINEAR_PROJ_NAMES: [reference_points, sampling_offsets]
+LR_LINEAR_PROJ_SCALE: 0.05
+LR_DICTIONARY_NAMES: [word_to_embed, embed_to_word]
+LR_DICTIONARY_SCALE: 1.0
+LR_WARMUP_EPOCHS: 1
+WEIGHT_DECAY: 0.0005
+MAX_CLIP_NORM: 0.1
+EPOCHS: 10
+SCHEDULER_MILESTONES: [6, 9]
+SCHEDULER_GAMMA: 0.1
+DETR_NUM_TRAIN_FRAMES: 4
+DETR_NUM_CHECKPOINT_FRAMES: 5
+USE_DECODER_CHECKPOINT: False
+ACCUMULATE_STEPS: 1
+SEPARATE_CLIP_NORM: True
+USE_ACCELERATE_CLIP_NORM: True
+
+# Resumes and Pretrains:
+# 与 DanceTrack 单类检测一致；需保证文件存在（train.py 启动时会 load_detr_pretrain 写入整模的 detr 部分）
+DETR_PRETRAIN: ./pretrains/r50_deformable_detr_coco_dancetrack
+#DETR_PRETRAIN: ./outputs/fld_notrain_motip_dancetrack_train25%/checkpoint_9.pth
+# 可选：接上阶段纯 MOTIP（USE_FLD_TRAIN=False）的 last.pth，再开联合训练更稳；缺 projector 键时会随机初始化 projector（strict=False）
+RESUME_MODEL:
+RESUME_OPTIMIZER: True
+RESUME_SCHEDULER: True
+RESUME_STATES: True
+
+# Inference settings:
+INFERENCE_MODEL:            # the model path for inference
+INFERENCE_DATASET: DanceTrack
+INFERENCE_SPLIT: val
+INFERENCE_MODE: evaluate    # evaluate or submit
+INFERENCE_GROUP: default    # group name for inference
+INFERENCE_MAX_LONGER: 1440  # max longer size for inference
+INFERENCE_DTYPE: FP16
+#ASSIGNMENT_PROTOCOL: hungarian
+ASSIGNMENT_PROTOCOL: object-max
+MISS_TOLERANCE: 30          # tolerance for missing frames
+DET_THRESH: 0.3
+NEWBORN_THRESH: 0.6
+ID_THRESH: 0.2
+AREA_THRESH: 0
+# Ablation / tracking mode (optional). When set, overrides USE_MOTIP / USE_HAT / USE_FLD for a single path:
+#   motip      — pure MOTIP (ID decoder + MOTIP trajectory, no FLD before decoder)
+#   motip_fld  — DETR → FLD(LDA) → ID decoder + MOTIP trajectory
+#   hat        — DETR + HAT (LDA+match, no ID decoder) + HAT trajectory (id_queue_hat)
+# Leave empty or omit to use USE_MOTIP / USE_HAT / USE_FLD below (incl. dual-branch).
+# 只改下面这一项即可切换 motip / motip_fld / hat（非空时会覆盖 USE_MOTIP、USE_HAT、USE_FLD；PRIMARY_ID_SOURCE 也会被设好，一般不用改）
+TRACKING_MODE: motip_fld
+
+# FLD 可学习升维：联合训练须二者同时为 True
+USE_FLD_PROJECTOR: True
+USE_FLD_TRAIN: True
+FLD_ALIGN_LOSS_WEIGHT: 0.1    # 对齐 unknown 上投影与原 DETR 特征方向；过大易压过 id_loss，可先 0.05~0.1 试
+FLD_FACTOR_THR: 4.0            # 与推理一致：历史样本数 > thr * 轨迹数 才拟合 LDA
+FLD_USE_STANDARD_SCALER: False
+FLD_DIRECT_INTER_CLASS_DIFF: True
+FLD_USE_WEIGHTED_CLASS_MEAN: True
+
+# HAT（仅当 TRACKING_MODE 留空且要跑双分支/单 HAT 时，才依赖下面开关；若已设 TRACKING_MODE，可忽略）
+USE_HAT: True
+USE_MOTIP: false
+HAT_HIST_LEN: 60               # History window length T (max features per trajectory)
+HAT_FACTOR_THR: 4.0            # Min ratio of historical features to trajectories to enable FLD
+HAT_ALPHA: 0.5                 # Knowledge Integration blending coefficient (0=original, 1=HAT only)
+HAT_WEIGHT_DECAY: 0.9          # Temporal weight decay for FIFO queue (Temporal-Shifted Centroid)
+INFERENCE_ONLY_DETR:
+
+# Outputs settings:
+OUTPUTS_DIR:                # 可为空，则默认 ./outputs/<EXP_NAME>
+USE_WANDB: False             # use wandb or not
+EXP_OWNER: XihaoXD
+EXP_PROJECT: MOTIP-FFE2
+EXP_GROUP:
+EXP_NAME: "fld_joint_motip_dancetrack_train25%"   # 与联合训练一致；可改
+GIT_VERSION:
+SAVE_CHECKPOINT_PER_EPOCH: 1
+MULTI_LAST_CHECKPOINTS: 0
+
+# For previous version of MOTIP checkpoints:
+USE_PREVIOUS_CHECKPOINT: False

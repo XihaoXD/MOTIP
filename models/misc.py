@@ -162,7 +162,8 @@ def load_checkpoint(model, path, states=None, optimizer=None, scheduler=None):
         load_detr_pretrain(model=model, pretrain_path=path, num_classes=None)
         return
     else:
-        model.load_state_dict(model_state)
+        # strict=False: allow older checkpoints without fld_projector / new submodule keys.
+        model.load_state_dict(model_state, strict=False)
 
     if optimizer is not None:
         optimizer.load_state_dict(load_state["optimizer"])

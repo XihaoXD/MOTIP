@@ -128,6 +128,31 @@ DET_THRESH: 0.3
 NEWBORN_THRESH: 0.6
 ID_THRESH: 0.2
 AREA_THRESH: 0
+# Ablation / tracking mode (optional). When set, overrides USE_MOTIP / USE_HAT / USE_FLD for a single path:
+#   motip      — pure MOTIP (ID decoder + MOTIP trajectory, no FLD before decoder)
+#   motip_fld  — DETR → FLD(LDA) → ID decoder + MOTIP trajectory
+#   hat        — DETR + HAT (LDA+match, no ID decoder) + HAT trajectory (id_queue_hat)
+# Leave empty or omit to use USE_MOTIP / USE_HAT / USE_FLD below (incl. dual-branch).
+# 只改下面这一项即可切换 motip / motip_fld / hat（非空时会覆盖 USE_MOTIP、USE_HAT、USE_FLD；PRIMARY_ID_SOURCE 也会被设好，一般不用改）
+TRACKING_MODE: motip_fld
+
+# FLD 可学习升维（LDA 子空间 -> FEATURE_DIM）与训练时对齐损失
+# USE_FLD_PROJECTOR: 为 True 时在模型中构建 FLDProjector；推理 motip_fld 时优先用投影而非纯填 0
+USE_FLD_PROJECTOR: True
+USE_FLD_TRAIN: False           # True：在训练 forward 中对 clip 做 LDA+投影，并加 FLD 对齐损失
+FLD_ALIGN_LOSS_WEIGHT: 0.1     # L_fld = weight * (1 - cos(sim)(proj_lda, det_feat))，仅 unknown 上统计
+FLD_FACTOR_THR: 4.0            # 与推理一致：历史样本数 > thr * 轨迹数 才拟合 LDA
+FLD_USE_STANDARD_SCALER: False
+FLD_DIRECT_INTER_CLASS_DIFF: True
+FLD_USE_WEIGHTED_CLASS_MEAN: True
+
+# HAT（仅当 TRACKING_MODE 留空且要跑双分支/单 HAT 时，才依赖下面开关；若已设 TRACKING_MODE，可忽略）
+USE_HAT: True
+USE_MOTIP: false
+HAT_HIST_LEN: 60               # History window length T (max features per trajectory)
+HAT_FACTOR_THR: 4.0            # Min ratio of historical features to trajectories to enable FLD
+HAT_ALPHA: 0.5                 # Knowledge Integration blending coefficient (0=original, 1=HAT only)
+HAT_WEIGHT_DECAY: 0.9          # Temporal weight decay for FIFO queue (Temporal-Shifted Centroid)
 INFERENCE_ONLY_DETR:
 
 # Outputs settings:

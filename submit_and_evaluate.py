@@ -3,6 +3,7 @@
 
 import os
 import time
+from typing import Optional
 import torch
 import subprocess
 from accelerate import Accelerator
@@ -66,6 +67,12 @@ def submit_and_evaluate(config: dict):
     else:
         logger.info(f"Outputs dir '{outputs_dir}' created.")
 
+    _tm = config.get("TRACKING_MODE")
+    if _tm is not None and str(_tm).strip():
+        logger.info(
+            f"TRACKING_MODE={_tm!r} (overrides USE_MOTIP/USE_HAT/USE_FLD; see resolve_tracking_mode)."
+        )
+
     model, _ = build_motip(config=config)
 
     use_previous_checkpoint = config.get("USE_PREVIOUS_CHECKPOINT", False)
@@ -99,6 +106,25 @@ def submit_and_evaluate(config: dict):
         inference_only_detr=config["INFERENCE_ONLY_DETR"] if config["INFERENCE_ONLY_DETR"] is not None
         else config["ONLY_DETR"],
         dtype=config.get("INFERENCE_DTYPE", "FP32"),
+        # Ablation: TRACKING_MODE overrides USE_MOTIP/USE_HAT/USE_FLD when set (see resolve_tracking_mode).
+        tracking_mode=config.get("TRACKING_MODE"),
+        # MOTIP vs HAT (parallel ID branches after DETR; legacy when TRACKING_MODE is unset):
+        use_motip=config.get("USE_MOTIP", True),
+        use_hat=config.get("USE_HAT", False),
+        primary_id_source=config.get("PRIMARY_ID_SOURCE", "motip"),
+        # HAT (History-Aware Transformation / LDA) settings:
+        hat_hist_len=config.get("HAT_HIST_LEN", 60),
+        hat_factor_thr=config.get("HAT_FACTOR_THR", 4.0),
+        hat_similarity_alpha=config.get("HAT_ALPHA", 0.5),
+        hat_weight_decay=config.get("HAT_WEIGHT_DECAY", 0.9),
+        # FLD (inside MOTIP id_decoder, no re-train needed):
+        use_fld=config.get("USE_FLD", False),
+        fld_hist_len=config.get("FLD_HIST_LEN", 60),
+        fld_factor_thr=config.get("FLD_FACTOR_THR", 4.0),
+        fld_similarity_alpha=config.get("FLD_SIMILARITY_ALPHA", 1.0),
+        fld_use_standard_scaler=config.get("FLD_USE_STANDARD_SCALER", False),
+        fld_direct_inter_class_diff=config.get("FLD_DIRECT_INTER_CLASS_DIFF", True),
+        fld_use_weighted_class_mean=config.get("FLD_USE_WEIGHTED_CLASS_MEAN", True),
     )
 
     if metrics is not None:
@@ -136,6 +162,24 @@ def submit_and_evaluate_one_model(
         area_thresh: int = 0,
         inference_only_detr: bool = False,
         dtype: str = "FP32",
+        tracking_mode: Optional[str] = None,
+        # MOTIP vs HAT (parallel ID branches):
+        use_motip: bool = True,
+        use_hat: bool = False,
+        primary_id_source: str = "motip",
+        # HAT settings:
+        hat_hist_len: int = 60,
+        hat_factor_thr: float = 4.0,
+        hat_similarity_alpha: float = 0.5,
+        hat_weight_decay: float = 0.9,
+        # FLD (LDA inside MOTIP branch, inference-only, no re-train):
+        use_fld: bool = False,
+        fld_hist_len: int = 60,
+        fld_factor_thr: float = 4.0,
+        fld_similarity_alpha: float = 1.0,
+        fld_use_standard_scaler: bool = False,
+        fld_direct_inter_class_diff: bool = True,
+        fld_use_weighted_class_mean: bool = True,
 ):
     # Build the datasets:
     inference_dataset = dataset_classes[dataset](
@@ -206,6 +250,21 @@ def submit_and_evaluate_one_model(
             area_thresh=area_thresh,
             only_detr=inference_only_detr,
             dtype=dtype,
+            tracking_mode=tracking_mode,
+            use_motip=use_motip,
+            use_hat=use_hat,
+            primary_id_source=primary_id_source,
+            hat_hist_len=hat_hist_len,
+            hat_factor_thr=hat_factor_thr,
+            hat_similarity_alpha=hat_similarity_alpha,
+            hat_weight_decay=hat_weight_decay,
+            use_fld=use_fld,
+            fld_hist_len=fld_hist_len,
+            fld_factor_thr=fld_factor_thr,
+            fld_similarity_alpha=fld_similarity_alpha,
+            fld_use_standard_scaler=fld_use_standard_scaler,
+            fld_direct_inter_class_diff=fld_direct_inter_class_diff,
+            fld_use_weighted_class_mean=fld_use_weighted_class_mean,
         )
         if is_fake:
             logger.info(
@@ -219,31 +278,52 @@ def submit_and_evaluate_one_model(
             sequence_loader=sequence_loader,
             logger=logger,
         )
-        # Write the results to the submit file:
+        # Write the results to the submit file(s):
         if dataset in ["DanceTrack", "SportsMOT", "MOT17", "PersonPath22_Inference", "BFT"]:
-            sequence_tracker_results = []
-            for t in range(len(sequence_results)):
-                for obj_id, score, category, bbox in zip(
-                        sequence_results[t]["id"],
-                        sequence_results[t]["score"],
-                        sequence_results[t]["category"],
-                        sequence_results[t]["bbox"],    # [x, y, w, h]
-                ):
-                    sequence_tracker_results.append(
-                        f"{t + 1},{obj_id.item()},"
-                        f"{bbox[0].item()},{bbox[1].item()},{bbox[2].item()},{bbox[3].item()},"
-                        f"1,-1,-1,-1\n"
+            def write_one_result(per_frame_results, subdir, label):
+                lines = []
+                for t in range(len(per_frame_results)):
+                    r = per_frame_results[t]
+                    for obj_id, score, category, bbox in zip(
+                            r["id"], r["score"], r["category"], r["bbox"],
+                    ):
+                        lines.append(
+                            f"{t + 1},{obj_id.item()},"
+                            f"{bbox[0].item()},{bbox[1].item()},{bbox[2].item()},{bbox[3].item()},"
+                            f"1,-1,-1,-1\n"
+                        )
+                if not is_fake:
+                    d = os.path.join(outputs_dir, "tracker", subdir)
+                    os.makedirs(d, exist_ok=True)
+                    with open(os.path.join(d, f"{sequence_name}.txt"), "w") as f:
+                        f.writelines(lines)
+                return lines
+
+            # Dual output (MOTIP + HAT): each frame is {"motip": {...}, "hat": {...}}
+            if sequence_results and isinstance(sequence_results[0], dict) and "motip" in sequence_results[0]:
+                motip_frames = [sequence_results[t]["motip"] for t in range(len(sequence_results))]
+                hat_frames = [sequence_results[t]["hat"] for t in range(len(sequence_results))]
+                write_one_result(motip_frames, "motip", "MOTIP")
+                write_one_result(hat_frames, "hat", "HAT")
+                # Also write primary to tracker/ so default eval (TRACKERS_FOLDER=tracker) finds it
+                primary_frames = motip_frames if primary_id_source == "motip" else hat_frames
+                write_one_result(primary_frames, "", "primary")
+                if not is_fake:
+                    logger.success(
+                        f"Submit sequence {sequence_name} done (MOTIP + HAT), FPS: {sequence_fps:.2f}. "
+                        f"Saved to tracker/, tracker/motip/, tracker/hat/.",
+                        only_main=False,
                     )
-            if not is_fake:
-                os.makedirs(os.path.join(outputs_dir, "tracker"), exist_ok=True)
-                with open(os.path.join(outputs_dir, "tracker", f"{sequence_name}.txt"), "w") as submit_file:
-                    submit_file.writelines(sequence_tracker_results)
-                logger.success(f"Submit sequence {sequence_name} done, FPS: {sequence_fps:.2f}. "
-                               f"Saved to {os.path.join(outputs_dir, 'tracker', f'{sequence_name}.txt')}.",
-                               only_main=False)
             else:
+                write_one_result(sequence_results, "", "tracker")
+                if not is_fake:
+                    logger.success(
+                        f"Submit sequence {sequence_name} done, FPS: {sequence_fps:.2f}. "
+                        f"Saved to {os.path.join(outputs_dir, 'tracker', f'{sequence_name}.txt')}.",
+                        only_main=False,
+                    )
+            if is_fake:
                 logger.success(f"Fake submit sequence {sequence_name} done, FPS: {sequence_fps:.2f}.", only_main=False)
-            pass
         else:
             raise NotImplementedError(f"Do not support to submit the results for dataset '{dataset}'.")
 
